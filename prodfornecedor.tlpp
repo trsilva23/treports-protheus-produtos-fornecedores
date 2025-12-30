@@ -1,66 +1,56 @@
 #include "protheus.ch"
 #include "msobject.ch"
 #include "totvs.framework.treports.integratedprovider.th"
+#include "config/provider_config.tlpp"
+#include "lib/fw_logger.tlpp"
     
 namespace custom.produtos.fornecedores
- 
+
 // Imported and adapted by trsilva23 on 2025-12-30
+// Changes: A1..A10 improvements applied (parameterization, validation, logging, safe close, config)
 
 @totvsFrameworkTReportsIntegratedProvider(active=.T., team="SIGACOM", tables="SA5", name="Produto X Fornecedor", country="ALL", initialRelease="12.1.2210")
-//-------------------------------------------------------------------
-/*{Protheus.doc} ProdFornTReportsBusinessObject
-Classe para criação do Objeto de Negócio de Prod  x Forn para o TReports
- 
-@since 02/03/2023
-@version 1.0
-*/
-//-------------------------------------------------------------------  
 class ProdFornTReportsBusinessObject from totvs.framework.treports.integratedprovider.IntegratedProvider
     public method new() as object
     public method getData() as object
     public method getSchema() as object
- 
+
     protected data aFields as array
     protected data aStruct as array
- 
+
 endclass
- 
-//-------------------------------------------------------------------
-/*{Protheus.doc} new
-Método de instância da classe
- 
-@return object: self
- 
-@since 02/03/2023
-@version 1.0
-*/
-//-------------------------------------------------------------------   
+
+// Helper: escape SQL literals (simple, treats values as strings)
+static function _EscapeSQL(cValue)
+    if ValType(cValue) <> "C" .or. empty(cValue)
+        return "NULL"
+    endif
+    // Replace single quote with two single quotes for SQL literal
+    return "'" + StrTran(cValue, "'", "''") + "'"
+return nil
+
+// Helper: build Oracle pagination wrapper
+static function _BuildPagedQueryOracle(cBaseQuery, nPage, nPageSize)
+    local nOffset := (nPage - 1) * nPageSize
+    local nMax := nOffset + nPageSize
+    local cPaged := "SELECT * FROM ( SELECT a.*, ROWNUM rnum FROM (" + cBaseQuery + ") a WHERE ROWNUM <= " + Str(nMax) + ") WHERE rnum > " + Str(nOffset)
+    return cPaged
+return nil
+
 method new() class ProdFornTReportsBusinessObject
-_Super:new()
-self:appendArea("Compras")
-self:setDisplayName("Fornecedores x Produtos")
-self:setDescription("Relatório Fornecedores x Produtos com tratamento LGPD")
- 
-self:aFields := {"A5_FILIAL", "A5_FORNECE", "A5_LOJA", "A5_NOMEFOR", "A5_PRODUTO", "A5_NOMPROD", "A5_CODPRF"}
-self:aStruct := getStruct(self:aFields)
- 
-return self
- 
-//-------------------------------------------------------------------
-/*{Protheus.doc} getData
-Retorna os dados do objeto de negócio
- 
-@param nPage, numérico, indica a página atual do relatório
-@param oFilter, objeto, contém o filtro do TReports
- 
-@return object: self:oData
- 
-@since 02/03/2023
-@version 1.0
-*/
-//-------------------------------------------------------------------   
+    _Super:new()
+    self:appendArea("Compras")
+    self:setDisplayName("Fornecedores x Produtos")
+    self:setDescription("Relatório Fornecedores x Produtos com tratamento LGPD")
+
+    self:aFields := {"A5_FILIAL", "A5_FORNECE", "A5_LOJA", "A5_NOMEFOR", "A5_PRODUTO", "A5_NOMPROD", "A5_CODPRF"}
+    self:aStruct := getStruct(self:aFields)
+
+    return self
+
 method getData(nPage as numeric, oFilter as object) as object class ProdFornTReportsBusinessObject
 local cQuery as character
+local cBaseQuery as character
 local cAlias as character
 local nSkip as numeric
 local nCount as numeric
@@ -68,83 +58,105 @@ local nX as numeric
 local jItems as json
 local aPDFields as array
 local lUseParams as logical
-  
-nCount := 0
-cQuery := "SELECT A5_FILIAL,A5_PRODUTO,A5_NOMPROD,A5_FORNECE,A5_NOMEFOR,A5_LOJA,A5_CODPRF FROM " + RetSQLName("SA5") + " WHERE D_E_L_E_T_ = ' '"
-lUseParams := .T.
+local cParams as character
+local lSuccess as logical
 
-//Os filtros serão setados na interface do novo TReports
-if oFilter:hasFilter()
-    cQuery += " AND " + oFilter:getSQLExpression()
-endif
-
-jParams := oFilter:getParameters() //metodo para retorno do json dos parâmetros
-
-if ValType(jParams["01"]) <> "A" .and. ValType(jParams["02"]) <> "A"
-    lUseParams := .F.
-endif
-
-if lUseParams .and. !empty(jParams["01"][1]) .and. !empty(jParams["02"][1])
-    cQuery += "AND A5_FORNECE BETWEEN " + jParams['01'][1] + " AND " +  jParams['02'][1]
-endif
-  
-cAlias := MPSysOpenQuery(cQuery)
-  
-if nPage == 1
-    (cAlias)->(dbGoTop())
-else
-    //Encontra a quantidade de itens que irá pular de acordo com a página atual
-    nSkip := ((nPage - 1) * self:getPageSize())     
-  
-    (cAlias)->(dbSkip(nSkip))
-endif  
-  
-//Verifica se precisa fazer o tratamento para LGPD
-aPDFields := FwProtectedDataUtil():UsrAccessPDField(__cUserID, self:aFields)
-lObfuscated := len( aPDFields ) != Len(self:aFields)
-
-while !(cAlias)->(Eof())
-    jItems := JsonObject():new()
- 
-    for nX := 1 To Len(self:aStruct)
-        if lObfuscated .and. aScan(aPDFields, self:aStruct[nX][5]) == 0
-            jItems[self:aStruct[nX][1]] := FwProtectedDataUtil():ValueAsteriskToAnonymize((cAlias)->&(self:aStruct[nX][5]))
-        else
-            jItems[self:aStruct[nX][1]] := (cAlias)->&(self:aStruct[nX][5])
-        endif
-    next nX
- 
-    self:oData:appendData(jItems)
- 
-    (cAlias)->(DBSkip())
-    nCount++
-  
-    //Sai do loop quando chegar no tamanho de itens da página
-    if nCount == self:getPageSize()
-      exit
+lSuccess := .F.
+try
+    nCount := 0
+    // base select
+    cBaseQuery := "SELECT A5_FILIAL,A5_PRODUTO,A5_NOMPROD,A5_FORNECE,A5_NOMEFOR,A5_LOJA,A5_CODPRF FROM " + RetSQLName(provider_config:TABLE_NAME) + " WHERE D_E_L_E_T_ = ' '"
+    // Use filter expression if present (oFilter should provide SQL expression already sanitized by the framework)
+    if oFilter:hasFilter()
+        cBaseQuery += " AND " + oFilter:getSQLExpression()
     endif
-enddo 
-  
-//Se não for o último registro indica que terá próxima página
-self:setHasNext(!(cAlias)->(Eof())) 
-  
-(cAlias)->(DBCloseArea())
-    
+
+    // Parameters JSON
+    jParams := oFilter:getParameters()
+
+    // Validate parameters
+    lUseParams := .T.
+    if ValType(jParams["01"]) <> "A" .and. ValType(jParams["02"]) <> "A"
+        lUseParams := .F.
+    endif
+
+    if lUseParams .and. !empty(jParams["01"][1]) .and. !empty(jParams["02"][1])
+        // Escape values safely
+        cStart := _EscapeSQL(jParams['01'][1])
+        cEnd := _EscapeSQL(jParams['02'][1])
+        cBaseQuery += " AND A5_FORNECE BETWEEN " + cStart + " AND " + cEnd
+    endif
+
+    // If configured, use Oracle pagination wrapper (A5)
+    if provider_config:USE_LIMIT_OFFSET
+        cQuery := _BuildPagedQueryOracle(cBaseQuery, nPage, provider_config:DEFAULT_PAGE_SIZE)
+    else
+        cQuery := cBaseQuery
+    endif
+
+    fw_logger:Info("Executing query: " + Left(cQuery, 1000))
+
+    cAlias := MPSysOpenQuery(cQuery)
+
+    // Positioning per page
+    if nPage == 1
+        (cAlias)->(dbGoTop())
+    else
+        nSkip := ((nPage - 1) * self:getPageSize())
+        (cAlias)->(dbSkip(nSkip))
+    endif
+
+    // LGPD handling
+    aPDFields := FwProtectedDataUtil():UsrAccessPDField(__cUserID, self:aFields)
+    lObfuscated := len( aPDFields ) != Len(self:aFields)
+
+    while !(cAlias)->(Eof())
+        jItems := JsonObject():new()
+        for nX := 1 To Len(self:aStruct)
+            local cFld := self:aStruct[nX][5]
+            local cKey := self:aStruct[nX][1]
+            local cVal := (cAlias)->&(cFld)
+            // convert date fields to ISO if required
+            if self:aStruct[nX][3] == "date"
+                cVal := FwTimeStamp(cVal, 6) // ensure ISO-like format
+            endif
+
+            if lObfuscated .and. aScan(aPDFields, cFld) == 0
+                jItems[cKey] := FwProtectedDataUtil():ValueAsteriskToAnonymize(cVal)
+            else
+                jItems[cKey] := cVal
+            endif
+        next nX
+
+        self:oData:appendData(jItems)
+
+        (cAlias)->(DBSkip())
+        nCount++
+
+        if nCount == self:getPageSize()
+            exit
+        endif
+    enddo
+
+    self:setHasNext(!(cAlias)->(Eof()))
+
+    lSuccess := .T.
+finally
+    // Ensure area is closed even on error
+    if ValType(cAlias) == "P" .and. (cAlias)->(isValid())
+        try
+            (cAlias)->(DBCloseArea())
+        catch
+            // ignore close errors
+        endtry
+    endif
+    fw_logger:Info("getData finished (success=" + (lSuccess ? "T" : "F") + ") - returned " + Str(nCount) + " rows")
+endtry
+
 return self:oData
- 
-//-------------------------------------------------------------------
-/*{Protheus.doc} getSchema
-Retorna a estrutura dos campos
- 
-@return object: self:oSchema
- 
-@since 02/03/2023
-@version 1.0
-*/
-//-------------------------------------------------------------------   
+
 method getSchema() as object class ProdFornTReportsBusinessObject
 Local nX as numeric
- 
 for nX := 1 To Len(self:aStruct)
     self:addProperty(self:aStruct[nX][1], self:aStruct[nX][2], self:aStruct[nX][3], self:aStruct[nX][4], self:aStruct[nX][5])
 Next nX
@@ -152,24 +164,11 @@ Next nX
 self:addParameter("01"  , "Fornecedor de", "string", .F.)
 self:addParameter("02"  , "Fornecedor até", "string", .F.)
 
-//Consulta dos parâmetros
 self:setCustomURL("01", "api/framework/v1/genericLookupService/smartview/SA2", 2)
 self:setCustomURL("02", "api/framework/v1/genericLookupService/smartview/SA2", 2)
-  
+
 return self:oSchema
- 
-//-------------------------------------------------------------------
-/*{Protheus.doc} getStruct
-Prepara a estrutura dos campos
- 
-@param aFlds array: Array com os campos do relatório
- 
-@return array: Array com a estrutura dos campos
- 
-@since 02/03/2023
-@version 1.0
-*/
-//------------------------------------------------------------------- 
+
 function getStruct(aFlds)
 Local aConvFld as array
 Local aFldTmp    as array
@@ -185,22 +184,17 @@ aFldTmp    := {}
 for nC := 1 to Len(aFlds)
     cFldQry := aFlds[nC]
     nPos    := AT(".", aFlds[nC]) + 1
-     
     if nPos > 0
         cCampo := Substr(cFldQry, nPos)
     else
         cCampo := cFldQry
     endif
-     
     cTipo := GetSx3Cache(cCampo, "X3_TIPO")
-     
     if (nPos := aScan(aConvFld, {|c| c[01] = cTipo})) > 0
         cTipR := aConvFld[nPos, 02]
     else
         cTipR := "string"
     endif
- 
     AAdd(aFldTmp, {cCampo, FWSX3Util():GetDescription(cCampo), cTipR, FwX3Titulo(Upper(cCampo)), cCampo})
 next nC
- 
 return (aFldTmp)
